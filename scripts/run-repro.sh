@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Seed → create SINK INTO sinks → wait for backfill catalogs to clear → compare counts.
+# Seed → CREATE SINK INTO → wait for backfill catalogs to idle → count →
+# recreate family sinks → count again. Underfill = family source rows
+# far exceed non-zero family columns on the wide table.
+#
+# EXPECT=report (default): exit 1 if underfill is visible, 0 if not.
+# EXPECT=bug:              exit 0 if underfill is visible, 1 if not.
 set -euo pipefail
 
 export PGHOST="${PGHOST:-127.0.0.1}"
@@ -9,43 +14,53 @@ export PGUSER="${PGUSER:-root}"
 export PGPASSWORD="${PGPASSWORD:-}"
 
 N_USERS="${N_USERS:-3000}"
+EXPECT="${EXPECT:-report}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PSQL=(psql -X -v ON_ERROR_STOP=1)
 
 echo "=== RisingWave version ==="
 "${PSQL[@]}" -c "SELECT version();"
+echo "N_USERS=${N_USERS} EXPECT=${EXPECT} RW_IMAGE=${RW_IMAGE:-<compose default>}"
 
-echo "=== Seed schema (N_USERS=${N_USERS}) ==="
+echo "=== Seed schema ==="
 "${PSQL[@]}" -f "${ROOT}/sql/seed.sql"
 
-echo "=== Insert ${N_USERS} users ==="
+echo "=== Insert ${N_USERS} users and family events ==="
+# RisingWave rejects PostgreSQL typed literals (`timestamptz '…'`).
+# DML is not visible across sessions until flush; keep load in one session.
 "${PSQL[@]}" <<SQL
+SET RW_IMPLICIT_FLUSH TO true;
+
 INSERT INTO users (user_id, created_at)
 SELECT
-  format(
-    'aaaaaaaa-bbbb-4ccc-8ddd-%012s',
-    to_hex(g)
-  ),
-  timestamptz '2024-01-01 00:00:00+00' + (g || ' minutes')::interval
+  'aaaaaaaa-bbbb-4ccc-8ddd-' || lpad(g::text, 12, '0'),
+  '2024-01-01 00:00:00+00'::timestamptz + (g * interval '1 minute')
 FROM generate_series(1, ${N_USERS}) AS g;
+
+-- Three events per user so the family MV is a real GROUP BY, not a 1:1 copy.
+INSERT INTO events_a (user_id, evt_id, amount)
+SELECT user_id, e, (1000 + e)::numeric
+FROM users, generate_series(1, 3) AS e;
+
+INSERT INTO events_b (user_id, evt_id, amount)
+SELECT user_id, e, (2000 + e)::numeric
+FROM users, generate_series(1, 3) AS e;
 SQL
 
-echo "=== Wait for family_metrics MV to catch up ==="
-for i in $(seq 1 60); do
-  n="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM family_metrics;")"
-  if [[ "${n}" -eq "${N_USERS}" ]]; then
-    echo "family_metrics has ${n} rows."
+echo "=== Wait for family MVs to catch up ==="
+for i in $(seq 1 90); do
+  a="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM family_a;")"
+  b="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM family_b;")"
+  if [[ "${a}" -eq "${N_USERS}" && "${b}" -eq "${N_USERS}" ]]; then
+    echo "family_a=${a} family_b=${b}"
     break
   fi
-  if [[ "${i}" -eq 60 ]]; then
-    echo "ERROR: family_metrics stuck at ${n}/${N_USERS}" >&2
+  if [[ "${i}" -eq 90 ]]; then
+    echo "ERROR: family_a=${a} family_b=${b} want ${N_USERS}" >&2
     exit 2
   fi
   sleep 1
 done
-
-echo "=== CREATE SINK INTO (BACKGROUND_DDL=true) ==="
-"${PSQL[@]}" -f "${ROOT}/sql/create_sinks.sql"
 
 wait_idle() {
   local label="$1"
@@ -56,7 +71,6 @@ wait_idle() {
     frag="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM rw_catalog.rw_fragment_backfill_progress;" 2>/dev/null || echo 0)"
     echo "t=${i}s ddl_progress=${ddl} fragment_backfill=${frag}"
     if [[ "${ddl}" == "0" && "${frag}" == "0" ]]; then
-      # Require two consecutive idle polls (BACKGROUND_DDL can briefly clear)
       sleep 2
       ddl2="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM rw_catalog.rw_ddl_progress;")"
       frag2="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM rw_catalog.rw_fragment_backfill_progress;" 2>/dev/null || echo 0)"
@@ -70,37 +84,78 @@ wait_idle() {
   echo "WARN: still not idle after ${max}s; continuing with counts anyway." >&2
 }
 
-wait_idle "after CREATE SINK" 240
-
-echo "=== Counts ==="
-"${PSQL[@]}" -f "${ROOT}/sql/check.sql"
-"${PSQL[@]}" -c "SELECT * FROM rw_catalog.rw_ddl_progress;"
-"${PSQL[@]}" -c "SELECT job_name, upstream_table_name, progress FROM rw_catalog.rw_fragment_backfill_progress;" 2>/dev/null || true
-
-read -r users_n family_src wide_rows wide_spine_nz wide_metric_nz < <(
+read_counts() {
   "${PSQL[@]}" -Atc "
     SELECT
       (SELECT COUNT(*) FROM users),
-      (SELECT COUNT(*) FROM family_metrics),
+      (SELECT COUNT(*) FROM family_a),
+      (SELECT COUNT(*) FROM family_b),
       (SELECT COUNT(*) FROM wide_user),
       (SELECT COUNT(*) FILTER (WHERE account_created_at IS NOT NULL) FROM wide_user),
-      (SELECT COUNT(*) FILTER (WHERE metric_lt <> 0) FROM wide_user);
+      (SELECT COUNT(*) FILTER (WHERE metric_a <> 0) FROM wide_user),
+      (SELECT COUNT(*) FILTER (WHERE metric_b <> 0) FROM wide_user);
   " | tr '|' ' '
-)
+}
 
-echo "users_n=${users_n} family_src=${family_src} wide_rows=${wide_rows} wide_spine_nz=${wide_spine_nz} wide_metric_nz=${wide_metric_nz}"
+print_catalogs() {
+  "${PSQL[@]}" -c "SELECT * FROM rw_catalog.rw_ddl_progress;"
+  "${PSQL[@]}" -c "SELECT job_name, upstream_table_name, progress FROM rw_catalog.rw_fragment_backfill_progress;" 2>/dev/null || true
+}
 
-# Expectation: after snapshot backfill, every family key lands in wide.
-# Prod observation: family_src≈6677, wide_metric_nz≈145 after CREATE (+ recreate).
-threshold_num=$(( family_src * 95 / 100 ))
-if [[ "${wide_metric_nz}" -lt "${threshold_num}" ]]; then
-  echo ""
-  echo "BUG REPRODUCED: wide metric fill ${wide_metric_nz}/${family_src} (< 95%)."
-  echo "SINK INTO snapshot appears incomplete while ddl/fragment progress is idle."
-  exit 1
+echo "=== CREATE SINK INTO (pass 1) ==="
+"${PSQL[@]}" -f "${ROOT}/sql/create_sinks.sql"
+wait_idle "after CREATE SINK pass 1" 240
+
+echo "=== Counts pass 1 (catalogs idle) ==="
+"${PSQL[@]}" -f "${ROOT}/sql/check.sql"
+print_catalogs
+read -r users_n src_a src_b wide_rows spine1 a1 b1 < <(read_counts)
+echo "pass1: users=${users_n} family_a_src=${src_a} family_b_src=${src_b} wide_rows=${wide_rows} spine_nz=${spine1} metric_a_nz=${a1} metric_b_nz=${b1}"
+
+echo "=== Recreate family sinks (pass 2) ==="
+"${PSQL[@]}" -f "${ROOT}/sql/recreate_family_sinks.sql"
+wait_idle "after CREATE SINK pass 2" 240
+
+echo "=== Counts pass 2 (catalogs idle) ==="
+"${PSQL[@]}" -f "${ROOT}/sql/check.sql"
+print_catalogs
+read -r users_n src_a src_b wide_rows spine2 a2 b2 < <(read_counts)
+echo "pass2: users=${users_n} family_a_src=${src_a} family_b_src=${src_b} wide_rows=${wide_rows} spine_nz=${spine2} metric_a_nz=${a2} metric_b_nz=${b2}"
+
+threshold_num=$(( src_a * 95 / 100 ))
+
+underfill1=0
+underfill2=0
+if [[ "${a1}" -lt "${threshold_num}" || "${b1}" -lt "${threshold_num}" ]]; then
+  underfill1=1
+fi
+if [[ "${a2}" -lt "${threshold_num}" || "${b2}" -lt "${threshold_num}" ]]; then
+  underfill2=1
 fi
 
 echo ""
-echo "NOT REPRODUCED on this build: wide_metric_nz=${wide_metric_nz} family_src=${family_src}."
-echo "Prod still saw ~145/6677 after full_refresh; try larger N_USERS or RisingWave Cloud."
+echo "=== Verdict ==="
+echo "pass1 underfill=${underfill1}  spine=${spine1}/${users_n}  metric_a=${a1}/${src_a}  metric_b=${b1}/${src_b}"
+echo "pass2 underfill=${underfill2}  spine=${spine2}/${users_n}  metric_a=${a2}/${src_a}  metric_b=${b2}/${src_b}"
+
+if [[ "${underfill1}" -eq 1 && "${underfill2}" -eq 1 ]]; then
+  echo "BUG REPRODUCED: family source count ≫ wide non-zero family columns after idle backfill, twice."
+  if [[ "${EXPECT}" == "bug" ]]; then
+    exit 0
+  fi
+  exit 1
+fi
+
+if [[ "${underfill1}" -eq 1 || "${underfill2}" -eq 1 ]]; then
+  echo "PARTIAL: underfill on one pass only (pass1=${underfill1} pass2=${underfill2}). Not treating as a stable repro."
+  if [[ "${EXPECT}" == "bug" ]]; then
+    exit 1
+  fi
+  exit 1
+fi
+
+echo "NOT REPRODUCED on this build: family columns stayed >= 95% filled on both passes."
+if [[ "${EXPECT}" == "bug" ]]; then
+  exit 1
+fi
 exit 0

@@ -7,10 +7,22 @@ on:
     branches: [main]
 
 jobs:
-  sink-into-snapshot:
-    name: SINK INTO snapshot backfill
+  sink-into-underfill:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: v3.0.2 prod-shape
+            image: risingwavelabs/risingwave:v3.0.2
+          - name: v3.1.0-rc.1 same SQL
+            image: risingwavelabs/risingwave:v3.1.0-rc.1
+    env:
+      RW_IMAGE: ${{ matrix.image }}
+      N_USERS: "3000"
+      EXPECT: report
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,7 +47,6 @@ jobs:
           PGPORT: "4566"
           PGDATABASE: dev
           PGUSER: root
-          N_USERS: "3000"
         run: bash scripts/run-repro.sh
 
       - name: RisingWave logs
