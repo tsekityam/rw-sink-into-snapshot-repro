@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Seed → CREATE SINK INTO → wait for backfill catalogs to clear →
-# snapshot counts → stream-key move (#26713) → compare counts.
+# Seed → CREATE SINK INTO → wait for backfill catalogs to idle → count →
+# recreate family sinks → count again. Underfill = family source rows
+# far exceed non-zero family columns on the wide table.
 #
-# EXPECT=report (default): exit 1 if the bug is visible, 0 if not.
-# EXPECT=bug:             exit 0 if the bug is visible, 1 if not.
-# EXPECT=fix:             exit 0 if the check passes, 1 if the bug is still there.
+# EXPECT=report (default): exit 1 if underfill is visible, 0 if not.
+# EXPECT=bug:              exit 0 if underfill is visible, 1 if not.
 set -euo pipefail
 
 export PGHOST="${PGHOST:-127.0.0.1}"
@@ -13,61 +13,54 @@ export PGDATABASE="${PGDATABASE:-dev}"
 export PGUSER="${PGUSER:-root}"
 export PGPASSWORD="${PGPASSWORD:-}"
 
-N_USERS="${N_USERS:-500}"
+N_USERS="${N_USERS:-3000}"
 EXPECT="${EXPECT:-report}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PSQL=(psql -X -v ON_ERROR_STOP=1)
 
 echo "=== RisingWave version ==="
 "${PSQL[@]}" -c "SELECT version();"
+echo "N_USERS=${N_USERS} EXPECT=${EXPECT} RW_IMAGE=${RW_IMAGE:-<compose default>}"
 
-echo "=== Seed schema (N_USERS=${N_USERS} EXPECT=${EXPECT}) ==="
+echo "=== Seed schema ==="
 "${PSQL[@]}" -f "${ROOT}/sql/seed.sql"
 
-echo "=== Insert ${N_USERS} users ==="
-# RisingWave does not accept PostgreSQL typed literals (`timestamptz '…'`).
+echo "=== Insert ${N_USERS} users and family events ==="
+# RisingWave rejects PostgreSQL typed literals (`timestamptz '…'`).
+# DML is not visible across sessions until flush; keep load in one session.
 "${PSQL[@]}" <<SQL
+SET RW_IMPLICIT_FLUSH TO true;
+
 INSERT INTO users (user_id, created_at)
 SELECT
   'aaaaaaaa-bbbb-4ccc-8ddd-' || lpad(g::text, 12, '0'),
   '2024-01-01 00:00:00+00'::timestamptz + (g * interval '1 minute')
 FROM generate_series(1, ${N_USERS}) AS g;
+
+-- Three events per user so the family MV is a real GROUP BY, not a 1:1 copy.
+INSERT INTO events_a (user_id, evt_id, amount)
+SELECT user_id, e, (1000 + e)::numeric
+FROM users, generate_series(1, 3) AS e;
+
+INSERT INTO events_b (user_id, evt_id, amount)
+SELECT user_id, e, (2000 + e)::numeric
+FROM users, generate_series(1, 3) AS e;
 SQL
 
-echo "=== Insert join_side (active + spare per user) ==="
-"${PSQL[@]}" <<SQL
-INSERT INTO join_side (join_id, user_id, owner_user_id, slot)
-SELECT
-  'a-' || user_id,
-  user_id,
-  user_id,
-  'active'
-FROM users
-UNION ALL
-SELECT
-  's-' || user_id,
-  'zzzzzzzz-ffff-4ccc-8ddd-000000000000',
-  user_id,
-  'spare'
-FROM users;
-SQL
-
-echo "=== Wait for family_metrics MV to catch up ==="
-for i in $(seq 1 60); do
-  n="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM family_metrics;")"
-  if [[ "${n}" -eq "${N_USERS}" ]]; then
-    echo "family_metrics has ${n} rows."
+echo "=== Wait for family MVs to catch up ==="
+for i in $(seq 1 90); do
+  a="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM family_a;")"
+  b="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM family_b;")"
+  if [[ "${a}" -eq "${N_USERS}" && "${b}" -eq "${N_USERS}" ]]; then
+    echo "family_a=${a} family_b=${b}"
     break
   fi
-  if [[ "${i}" -eq 60 ]]; then
-    echo "ERROR: family_metrics stuck at ${n}/${N_USERS}" >&2
+  if [[ "${i}" -eq 90 ]]; then
+    echo "ERROR: family_a=${a} family_b=${b} want ${N_USERS}" >&2
     exit 2
   fi
   sleep 1
 done
-
-echo "=== CREATE SINK INTO (BACKGROUND_DDL=true) ==="
-"${PSQL[@]}" -f "${ROOT}/sql/create_sinks.sql"
 
 wait_idle() {
   local label="$1"
@@ -78,7 +71,6 @@ wait_idle() {
     frag="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM rw_catalog.rw_fragment_backfill_progress;" 2>/dev/null || echo 0)"
     echo "t=${i}s ddl_progress=${ddl} fragment_backfill=${frag}"
     if [[ "${ddl}" == "0" && "${frag}" == "0" ]]; then
-      # Require two consecutive idle polls (BACKGROUND_DDL can briefly clear)
       sleep 2
       ddl2="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM rw_catalog.rw_ddl_progress;")"
       frag2="$("${PSQL[@]}" -Atc "SELECT COUNT(*) FROM rw_catalog.rw_fragment_backfill_progress;" 2>/dev/null || echo 0)"
@@ -93,82 +85,77 @@ wait_idle() {
 }
 
 read_counts() {
-  # users_n|family_src|join_n|wide_rows|wide_spine_nz|wide_metric_nz|wide_ao_nz
   "${PSQL[@]}" -Atc "
     SELECT
       (SELECT COUNT(*) FROM users),
-      (SELECT COUNT(*) FROM family_metrics),
-      (SELECT COUNT(*) FROM join_side),
+      (SELECT COUNT(*) FROM family_a),
+      (SELECT COUNT(*) FROM family_b),
       (SELECT COUNT(*) FROM wide_user),
       (SELECT COUNT(*) FILTER (WHERE account_created_at IS NOT NULL) FROM wide_user),
-      (SELECT COUNT(*) FILTER (WHERE metric_lt <> 0) FROM wide_user),
-      (SELECT COUNT(*) FILTER (WHERE metric_ao <> 0) FROM wide_user);
+      (SELECT COUNT(*) FILTER (WHERE metric_a <> 0) FROM wide_user),
+      (SELECT COUNT(*) FILTER (WHERE metric_b <> 0) FROM wide_user);
   " | tr '|' ' '
 }
 
-wait_idle "after CREATE SINK" 240
+print_catalogs() {
+  "${PSQL[@]}" -c "SELECT * FROM rw_catalog.rw_ddl_progress;"
+  "${PSQL[@]}" -c "SELECT job_name, upstream_table_name, progress FROM rw_catalog.rw_fragment_backfill_progress;" 2>/dev/null || true
+}
 
-echo "=== Phase 1: snapshot backfill counts (catalogs idle) ==="
+echo "=== CREATE SINK INTO (pass 1) ==="
+"${PSQL[@]}" -f "${ROOT}/sql/create_sinks.sql"
+wait_idle "after CREATE SINK pass 1" 240
+
+echo "=== Counts pass 1 (catalogs idle) ==="
 "${PSQL[@]}" -f "${ROOT}/sql/check.sql"
-"${PSQL[@]}" -c "SELECT * FROM rw_catalog.rw_ddl_progress;"
-"${PSQL[@]}" -c "SELECT job_name, upstream_table_name, progress FROM rw_catalog.rw_fragment_backfill_progress;" 2>/dev/null || true
+print_catalogs
+read -r users_n src_a src_b wide_rows spine1 a1 b1 < <(read_counts)
+echo "pass1: users=${users_n} family_a_src=${src_a} family_b_src=${src_b} wide_rows=${wide_rows} spine_nz=${spine1} metric_a_nz=${a1} metric_b_nz=${b1}"
 
-read -r users_n family_src join_n wide_rows snap_spine snap_metric snap_ao < <(read_counts)
-echo "snapshot: users_n=${users_n} family_src=${family_src} join_n=${join_n} wide_rows=${wide_rows} wide_spine_nz=${snap_spine} wide_metric_nz=${snap_metric} wide_ao_nz=${snap_ao}"
+echo "=== Recreate family sinks (pass 2) ==="
+"${PSQL[@]}" -f "${ROOT}/sql/recreate_family_sinks.sql"
+wait_idle "after CREATE SINK pass 2" 240
 
-echo "=== Phase 2: stream-key move (join row hops to spare join_id, one barrier) ==="
-"${PSQL[@]}" -f "${ROOT}/sql/swap_join_keys.sql"
-
-# Give the upsert sink a moment to apply the barrier, then require idle catalogs.
-sleep 3
-wait_idle "after stream-key move" 60
-
-echo "=== Phase 2 counts ==="
+echo "=== Counts pass 2 (catalogs idle) ==="
 "${PSQL[@]}" -f "${ROOT}/sql/check.sql"
+print_catalogs
+read -r users_n src_a src_b wide_rows spine2 a2 b2 < <(read_counts)
+echo "pass2: users=${users_n} family_a_src=${src_a} family_b_src=${src_b} wide_rows=${wide_rows} spine_nz=${spine2} metric_a_nz=${a2} metric_b_nz=${b2}"
 
-read -r users_n family_src join_n wide_rows wide_spine_nz wide_metric_nz wide_ao_nz < <(read_counts)
-echo "after_swap: users_n=${users_n} family_src=${family_src} join_n=${join_n} wide_rows=${wide_rows} wide_spine_nz=${wide_spine_nz} wide_metric_nz=${wide_metric_nz} wide_ao_nz=${wide_ao_nz}"
+threshold_num=$(( src_a * 95 / 100 ))
 
-threshold_num=$(( family_src * 95 / 100 ))
-
-snap_underfill=0
-if [[ "${snap_metric}" -lt "${threshold_num}" || "${snap_ao}" -lt "${threshold_num}" || "${snap_spine}" -lt "${threshold_num}" ]]; then
-  snap_underfill=1
+underfill1=0
+underfill2=0
+if [[ "${a1}" -lt "${threshold_num}" || "${b1}" -lt "${threshold_num}" ]]; then
+  underfill1=1
 fi
-
-# #26713 signature: Delete+Insert for the same PK wipes columns other sinks wrote.
-# metric_lt is rewritten by the join Insert; spine / force_append_only are not.
-keymove_wipe=0
-if [[ "${wide_spine_nz}" -lt "${threshold_num}" || "${wide_ao_nz}" -lt "${threshold_num}" ]]; then
-  keymove_wipe=1
-fi
-
-bug=0
-if [[ "${snap_underfill}" -eq 1 || "${keymove_wipe}" -eq 1 ]]; then
-  bug=1
+if [[ "${a2}" -lt "${threshold_num}" || "${b2}" -lt "${threshold_num}" ]]; then
+  underfill2=1
 fi
 
 echo ""
 echo "=== Verdict ==="
-echo "snapshot underfill=${snap_underfill} (spine=${snap_spine} metric_lt=${snap_metric} metric_ao=${snap_ao} / ${family_src})"
-echo "key-move wipe=${keymove_wipe} (spine=${wide_spine_nz} metric_lt=${wide_metric_nz} metric_ao=${wide_ao_nz} / ${family_src})"
+echo "pass1 underfill=${underfill1}  spine=${spine1}/${users_n}  metric_a=${a1}/${src_a}  metric_b=${b1}/${src_b}"
+echo "pass2 underfill=${underfill2}  spine=${spine2}/${users_n}  metric_a=${a2}/${src_a}  metric_b=${b2}/${src_b}"
 
-if [[ "${bug}" -eq 1 ]]; then
-  echo "BUG REPRODUCED: SINK INTO + DO UPDATE IF NOT NULL lost columns (RisingWave #26713 class)."
+if [[ "${underfill1}" -eq 1 && "${underfill2}" -eq 1 ]]; then
+  echo "BUG REPRODUCED: family source count ≫ wide non-zero family columns after idle backfill, twice."
   if [[ "${EXPECT}" == "bug" ]]; then
-    echo "EXPECT=bug: this is the intended result on the broken baseline image."
     exit 0
   fi
-  if [[ "${EXPECT}" == "fix" ]]; then
-    echo "EXPECT=fix: this image still shows the bug."
+  exit 1
+fi
+
+if [[ "${underfill1}" -eq 1 || "${underfill2}" -eq 1 ]]; then
+  echo "PARTIAL: underfill on one pass only (pass1=${underfill1} pass2=${underfill2}). Not treating as a stable repro."
+  if [[ "${EXPECT}" == "bug" ]]; then
     exit 1
   fi
   exit 1
 fi
 
-echo "NOT REPRODUCED on this build: spine/metric/ao remain filled after snapshot and stream-key move."
+echo "NOT REPRODUCED on this build: family columns stayed >= 95% filled on both passes."
 if [[ "${EXPECT}" == "bug" ]]; then
-  echo "EXPECT=bug: harness did not observe underfill/wipe on this image."
   exit 1
 fi
 exit 0

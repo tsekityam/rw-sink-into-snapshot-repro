@@ -1,12 +1,6 @@
-# RisingWave SINK INTO wide-table underfill repro
+# Reproduce RisingWave `SINK INTO` wide-table underfill
 
-Minimal, self-contained reproduction of RisingWave **losing columns** on a wide table maintained by several `CREATE SINK … INTO` sinks when:
-
-- the target uses `ON CONFLICT DO UPDATE IF NOT NULL` (this auto-enables `preserve_row_level_changes`)
-- a non-append-only sink’s **stream key differs from the table PK** (join)
-- a row **moves between stream keys in one barrier**
-
-That is the failure mode fixed in [risingwavelabs/risingwave#26713](https://github.com/risingwavelabs/risingwave/pull/26713) (regression of #26015). RisingWave support mapped Magic Eden / CF-2894 (`CREATE SINK … INTO` underfill on `int_user_risk_wide`) to this issue and asked us to verify the fix on **v3.1.0-rc.1** before they prepare a patch image (the fix is also headed for **v3.0.4**).
+Minimal public harness for this symptom: after `CREATE SINK … INTO` finishes and backfill catalogs go idle, a **family source MV has many more rows than non-zero family columns on the wide table**, while the spine column looks fine. Recreating the family sinks still underfills.
 
 This repository is synthetic. It does not use any proprietary schema.
 
@@ -14,15 +8,15 @@ This repository is synthetic. It does not use any proprietary schema.
 
 | Path | Role |
 | --- | --- |
-| [`docker-compose.yml`](docker-compose.yml) | Official playground-style RisingWave (`single_node --in-memory`), `psql` on `localhost:4566` |
-| [`.devcontainer/`](.devcontainer/) | VS Code / Cursor / `devcontainers/ci` environment on the same compose stack |
-| [`sql/seed.sql`](sql/seed.sql) | `users`, `join_side`, `family_metrics` MV, `wide_user` (`DO UPDATE IF NOT NULL`) |
-| [`sql/create_sinks.sql`](sql/create_sinks.sql) | spine + `force_append_only` family + join upsert family |
-| [`sql/swap_join_keys.sql`](sql/swap_join_keys.sql) | one-barrier stream-key move (the #26713 trigger) |
-| [`sql/check.sql`](sql/check.sql) | row counts + non-zero / non-null column counts |
-| [`scripts/run-repro.sh`](scripts/run-repro.sh) | Wait → seed → `CREATE SINK` → catalogs idle → swap → verdict |
-| [`.github/workflows/repro.yml`](.github/workflows/repro.yml) | Matrix: v3.0.3 must show the bug, v3.1.0-rc.1 must pass |
-| [`VERSION`](VERSION) | Pinned images and how to bump them |
+| [`docker-compose.yml`](docker-compose.yml) | Playground-style RisingWave (`single_node --in-memory`), `psql` on `localhost:4566` |
+| [`.devcontainer/`](.devcontainer/) | VS Code / Cursor environment on the same compose stack |
+| [`sql/seed.sql`](sql/seed.sql) | `users`, per-family event tables + MVs, `wide_user` (`DO UPDATE IF NOT NULL`) |
+| [`sql/create_sinks.sql`](sql/create_sinks.sql) | spine `SINK INTO` + two `force_append_only` family sinks |
+| [`sql/recreate_family_sinks.sql`](sql/recreate_family_sinks.sql) | drop + create family sinks again (second pass) |
+| [`sql/check.sql`](sql/check.sql) | source counts vs wide non-zero column counts |
+| [`scripts/run-repro.sh`](scripts/run-repro.sh) | seed → create → wait idle → count → recreate → count |
+| [`.github/workflows/repro.yml`](.github/workflows/repro.yml) | CI matrix of the two images below |
+| [`VERSION`](VERSION) | Pinned image and how to bump it |
 
 Connect with:
 
@@ -30,104 +24,89 @@ Connect with:
 psql -h localhost -p 4566 -d dev -U root
 ```
 
-## Images
+## Step 1 — reproduce on the current prod-class image
 
-| Role | Image | Expect |
-| --- | --- | --- |
-| **Broken baseline** | `risingwavelabs/risingwave:v3.0.3` (compose default) | After the stream-key move, spine / force_append_only columns are wiped |
-| **Fixed** | `risingwavelabs/risingwave:v3.1.0-rc.1` | Same columns survive; check passes |
-
-v3.1.0-rc.1 is the first public tag that contains #26713. A v3.0.4 patch image is expected later.
-
-## Data and sinks
-
-`wide_user(user_id PK, account_created_at, metric_lt, metric_ao)` with `ON CONFLICT DO UPDATE IF NOT NULL`.
-
-| Sink | Writes | Stream key vs PK | Notes |
-| --- | --- | --- | --- |
-| `sink_users_spine` | `user_id`, `account_created_at` | equal (`user_id`) | spine |
-| `sink_family_append` | `user_id`, `metric_ao` | equal | `type=append-only`, `force_append_only=true` (prod-shaped) |
-| `sink_family_join` | `user_id`, `metric_lt` | **differs** (join of `family_metrics` + `join_side`) | #26713 path |
-
-`N_USERS` default is 500 (override with the env var). Keys are text UUIDs (`aaaaaaaa-bbbb-4ccc-8ddd-…`). Each user has an **active** `join_side` row and a **spare** dummy row. Phase 2 swaps them in a single `UPDATE` so every join row hops to a new stream key inside one barrier — the same pattern as RisingWave’s e2e `stream_key_mismatch_partial_update.slt` from #26713.
-
-## How to run locally
-
-### Prove the bug on v3.0.3
+Pin: **`risingwavelabs/risingwave:v3.0.2`** (Docker Hub tag exists; RW support said the cluster is ~3.0.2 / ticket “3.0”).
 
 ```bash
 docker compose down -v
 docker compose up -d --wait risingwave
 export PGHOST=127.0.0.1 PGPORT=4566 PGDATABASE=dev PGUSER=root
 bash scripts/wait-for-rw.sh
-bash scripts/run-repro.sh
-# or: EXPECT=bug bash scripts/run-repro.sh   # exit 0 when the bug is visible
+N_USERS=3000 bash scripts/run-repro.sh
 ```
 
-One-shot runner (no host `psql`):
+One-shot (no host `psql`):
 
 ```bash
 docker compose up -d --wait risingwave
 docker compose --profile test run --rm tester
 ```
 
-### Verify the fix on v3.1.0-rc.1
+**Pass/fail:** after `rw_ddl_progress` and `rw_fragment_backfill_progress` are idle, `family_a` / `family_b` `COUNT(*)` is ground truth. The wide table **underfills** when `COUNT(*) FILTER (WHERE metric_a <> 0)` (or `metric_b`) is **well below** that source count (script: &lt; 95%), while `account_created_at` (spine) stays populated. Pass 2 drops and recreates the family sinks so a one-off race is not enough.
+
+## Step 2 — same SQL on a candidate build
+
+Only after Step 1 underfills. `v3.0.4` is not released; do not invent that tag.
 
 ```bash
 docker compose down -v
 RW_IMAGE=risingwavelabs/risingwave:v3.1.0-rc.1 docker compose up -d --wait risingwave
 export PGHOST=127.0.0.1 PGPORT=4566 PGDATABASE=dev PGUSER=root
 bash scripts/wait-for-rw.sh
-EXPECT=fix bash scripts/run-repro.sh
+N_USERS=3000 bash scripts/run-repro.sh
 ```
 
-### Dev container (VS Code / Cursor)
+This answers “does *this harness* still underfill on that image?”, not “this is production’s root cause.”
 
-1. Clone this repo and reopen in the container (Dev Containers).
-2. Compose starts RisingWave (v3.0.3 by default); `postStartCommand` waits for `psql`.
-3. In the container terminal: `bash scripts/run-repro.sh`.
+## Schema
 
-`PGHOST=risingwave` is already set. Dashboard: port `5691`.
+`wide_user(user_id PK, account_created_at, metric_a, metric_b) ON CONFLICT DO UPDATE IF NOT NULL`
 
-## Observed results (this harness)
+| Sink | Writes | Options |
+| --- | --- | --- |
+| `sink_users_spine` | `user_id`, `account_created_at` | default (upsert) |
+| `sink_family_a` | `user_id`, `metric_a` | `type=append-only`, `force_append_only=true` |
+| `sink_family_b` | `user_id`, `metric_b` | `type=append-only`, `force_append_only=true` |
 
-Run locally against playground `single_node --in-memory`. `N_USERS=500`. Backfill catalogs (`rw_ddl_progress`, `rw_fragment_backfill_progress`) were idle in both runs before counts were taken.
+`family_a` / `family_b` are `GROUP BY user_id` MVs over per-user events (every user has a non-zero sum). Default `N_USERS=3000`. `metric_*` columns use `DEFAULT 0` (load-bearing; see below).
 
-| Image | `version()` | Phase 1 snapshot (spine / metric_lt / metric_ao) | Phase 2 after stream-key move | Verdict |
-| --- | --- | --- | --- | --- |
-| `v3.0.3` | _fill in after run_ | _fill in_ | _fill in_ | **BUG REPRODUCED** |
-| `v3.1.0-rc.1` | _fill in_ | _fill in_ | _fill in_ | **pass** |
+## Observed results
 
-Pass/fail criteria (script):
+Playground `single_node --in-memory`, `N_USERS=3000`. Catalogs were idle (`rw_ddl_progress` = 0, `rw_fragment_backfill_progress` = 0) before each count.
 
-- **Bug:** after catalogs are idle, spine fill or `metric_ao` fill is `< 95%` of `family_metrics` either at snapshot or after the stream-key move.
-- **Pass:** spine, `metric_lt`, and `metric_ao` all stay `≥ 95%` through both phases.
-- Typical #26713 signature on v3.0.3: snapshot is full, then the swap leaves `metric_lt` filled (rewritten by the join Insert) while `account_created_at` and `metric_ao` drop to 0 / NULL.
+| Image | `version()` | Pass | spine_nz / users | metric_a_nz / family_a | metric_b_nz / family_b | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| `v3.0.2` | `PostgreSQL 13.14.0-RisingWave-3.0.2 (391c3a16ef26d0cd86d1236c9b7c122a9a27fb1e)` | 1 | **3000 / 3000** | **0 / 3000** | 3000 / 3000 | underfill |
+| `v3.0.2` | same | 2 (recreate family sinks) | **3000 / 3000** | **0 / 3000** | 3000 / 3000 | underfill again |
+| `v3.1.0-rc.1` | `PostgreSQL 13.14.0-RisingWave-3.1.0-rc.1 (e4644f6ff28b405aeb4a5937386b45f6112c2c11)` | 1 | **3000 / 3000** | **0 / 3000** | 3000 / 3000 | still underfills |
+| `v3.1.0-rc.1` | same | 2 | **3000 / 3000** | **0 / 3000** | 3000 / 3000 | still underfills |
+
+Spine is full. `family_a` source is 3000 rows with `metric_a = 3006`, but the wide column stays `0` (the table default) after both creates. `family_b` is full in these runs (last family sink).
+
+**Step 2:** identical SQL on `v3.1.0-rc.1` did **not** clear the underfill.
+
+A one-off probe on v3.0.2 **without** `DEFAULT 0` on `metric_a` / `metric_b` filled both families (500/500). `DEFAULT 0` is therefore load-bearing for *this* harness: RisingWave fills omitted `SINK INTO` columns with the table default, and `0` is not NULL, so `DO UPDATE IF NOT NULL` can overwrite the other family’s column.
 
 ### Exit codes
 
-| Code | `EXPECT=report` (default) | `EXPECT=bug` | `EXPECT=fix` |
-| --- | --- | --- | --- |
-| **0** | Not reproduced | Bug visible (intended on v3.0.3) | Check passed (intended on v3.1.0-rc.1) |
-| **1** | **BUG REPRODUCED** | Harness did not see the bug | Bug still present |
-| **2** | Setup failure (RisingWave never became ready, seed/MV stuck) | same | same |
+| Code | Meaning |
+| --- | --- |
+| **1** | **BUG REPRODUCED** (default `EXPECT=report`): both passes underfill. |
+| **0** | Not reproduced: family columns ≥ 95% on both passes. |
+| **2** | Setup failure (RisingWave never ready, seed/MV stuck). |
+
+`EXPECT=bug` inverts 0/1 so a job can be green when underfill is visible.
 
 ## CI
 
-[`.github/workflows/repro.yml`](.github/workflows/repro.yml) on `push` and `pull_request` to `main` runs a **matrix**:
+[`.github/workflows/repro.yml`](.github/workflows/repro.yml) runs the **same** script on `v3.0.2` and `v3.1.0-rc.1` (`EXPECT=report`, `fail-fast: false`). A red job with `BUG REPRODUCED` means that image still underfills this harness.
 
-| Job | `RW_IMAGE` | `EXPECT` | Green means |
-| --- | --- | --- | --- |
-| `v3.0.3 (expect bug)` | `risingwavelabs/risingwave:v3.0.3` | `bug` | The wipe is still visible on the broken baseline |
-| `v3.1.0-rc.1 (expect fix)` | `risingwavelabs/risingwave:v3.1.0-rc.1` | `fix` | The #26713 image keeps other sinks’ columns |
+## Context
 
-Both jobs: `docker compose up -d --wait risingwave` with `RW_IMAGE` from the matrix, install `postgresql-client`, `bash scripts/run-repro.sh` against `localhost:4566`.
+Production (not in this repo): wide table filled by a spine `SINK INTO` plus several `force_append_only` family sinks; one family source MV had ~6677 rows but the wide table only ~84–145 non-zero columns for that family after create finished and backfill catalogs were empty.
 
-## Upstream
-
-- Fix PR: [risingwavelabs/risingwave#26713](https://github.com/risingwavelabs/risingwave/pull/26713) — keep sink-into-table upsert semantics with `preserve_row_level_changes` when the stream key ≠ table PK. Merged; cherry-picks to release-3.0 / release-2.8.
-- Customer tickets: CF-2894 (this underfill), CF-2771 (the report cited in the PR).
-- Prod symptom (Magic Eden, not in this repo): wide table `int_user_risk_wide` with multiple `SINK INTO` (spine + `force_append_only` family sinks); casino source MV ~6677 rows but wide only ~84–145 non-zero casino columns after create finishes and backfill catalogs go empty.
+RisingWave support (CF-2894) suggested this *might* relate to [risingwavelabs/risingwave#26713](https://github.com/risingwavelabs/risingwave/pull/26713). That is a footnote, not the goal of this repo. On this harness, **v3.1.0-rc.1 (which contains #26713) still underfills**, so this reproduction is not evidence that #26713 addresses the counts above.
 
 ## License
 

@@ -1,10 +1,11 @@
 # Official playground / quickstart style: one RisingWave process, psql on :4566.
-# Pins are documented in VERSION.
-#   Broken baseline: risingwavelabs/risingwave:v3.0.3  (default)
-#   Fixed:           RW_IMAGE=risingwavelabs/risingwave:v3.1.0-rc.1 docker compose up
+# Default pin is the current prod-class image (see VERSION):
+#   risingwavelabs/risingwave:v3.0.2
+# After Step 1 underfills, compare with:
+#   RW_IMAGE=risingwavelabs/risingwave:v3.1.0-rc.1 docker compose up
 services:
   risingwave:
-    image: ${RW_IMAGE:-risingwavelabs/risingwave:v3.0.3}
+    image: ${RW_IMAGE:-risingwavelabs/risingwave:v3.0.2}
     container_name: rw-sink-into-snapshot-repro
     command: ["single_node", "--in-memory"]
     ports:
@@ -31,8 +32,9 @@ services:
       PGPORT: "4566"
       PGDATABASE: dev
       PGUSER: root
-      N_USERS: "${N_USERS:-500}"
+      N_USERS: "${N_USERS:-3000}"
       EXPECT: "${EXPECT:-report}"
+      RW_IMAGE: "${RW_IMAGE:-risingwavelabs/risingwave:v3.0.2}"
     volumes:
       - .:/repro
     working_dir: /repro

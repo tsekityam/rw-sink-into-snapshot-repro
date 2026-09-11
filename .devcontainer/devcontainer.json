@@ -1,5 +1,5 @@
 {
-  "name": "RisingWave SINK INTO snapshot repro",
+  "name": "RisingWave SINK INTO underfill repro",
   "dockerComposeFile": ["../docker-compose.yml", "docker-compose.yml"],
   "service": "dev",
   "workspaceFolder": "/workspace",
