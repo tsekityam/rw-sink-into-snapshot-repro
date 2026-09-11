@@ -8,9 +8,25 @@ on:
 
 jobs:
   sink-into-snapshot:
-    name: SINK INTO snapshot backfill
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Broken baseline: #26713 wipe must be visible (EXPECT=bug → green CI).
+          - name: v3.0.3 (expect bug)
+            image: risingwavelabs/risingwave:v3.0.3
+            expect: bug
+          # Fix image: wide columns must survive the stream-key move.
+          - name: v3.1.0-rc.1 (expect fix)
+            image: risingwavelabs/risingwave:v3.1.0-rc.1
+            expect: fix
+    env:
+      RW_IMAGE: ${{ matrix.image }}
+      EXPECT: ${{ matrix.expect }}
+      N_USERS: "500"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,7 +51,6 @@ jobs:
           PGPORT: "4566"
           PGDATABASE: dev
           PGUSER: root
-          N_USERS: "3000"
         run: bash scripts/run-repro.sh
 
       - name: RisingWave logs

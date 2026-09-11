@@ -1,4 +1,12 @@
-# Pinned RisingWave image for this repro.
+# Pinned RisingWave images for this repro.
+#
+# Broken baseline (expect BUG REPRODUCED after the stream-key move):
+RW_IMAGE=risingwavelabs/risingwave:v3.0.3
+#
+# Fixed (expect the check to pass). Only ships the #26713 fix so far:
+#   RW_IMAGE=risingwavelabs/risingwave:v3.1.0-rc.1
+# Will also land in v3.0.4 once that patch image exists.
+#
 # How to bump:
 #   1. Check the latest stable tag at
 #      https://github.com/risingwavelabs/risingwave/releases
@@ -7,4 +15,3 @@
 #      risingwavelabs/risingwave:vX.Y.Z
 #   3. Keep the container command as `single_node --in-memory`
 #      (official playground / quickstart standalone style).
-RW_IMAGE=risingwavelabs/risingwave:v3.0.3

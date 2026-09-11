@@ -1,6 +1,7 @@
 # Official playground / quickstart style: one RisingWave process, psql on :4566.
-# Pin is documented in VERSION. Override with:
-#   RW_IMAGE=risingwavelabs/risingwave:vX.Y.Z docker compose up
+# Pins are documented in VERSION.
+#   Broken baseline: risingwavelabs/risingwave:v3.0.3  (default)
+#   Fixed:           RW_IMAGE=risingwavelabs/risingwave:v3.1.0-rc.1 docker compose up
 services:
   risingwave:
     image: ${RW_IMAGE:-risingwavelabs/risingwave:v3.0.3}
@@ -30,7 +31,8 @@ services:
       PGPORT: "4566"
       PGDATABASE: dev
       PGUSER: root
-      N_USERS: "${N_USERS:-3000}"
+      N_USERS: "${N_USERS:-500}"
+      EXPECT: "${EXPECT:-report}"
     volumes:
       - .:/repro
     working_dir: /repro
